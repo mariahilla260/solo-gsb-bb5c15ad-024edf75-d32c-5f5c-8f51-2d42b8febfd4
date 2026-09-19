@@ -273,6 +273,32 @@ class LicensePolicyRequest(AuditLockRequest):
     )
 
 
+class LockDiffRequest(ResolveRequest):
+    """POST /lock-diff 的请求体：在 /resolve 全部字段上附加两份锁定清单。
+
+    before_lock 与 after_lock 在同一仓库快照、同一目标环境、同一根约束下
+    各自独立地按 /audit-lock 的同一套规则校验；任一无效返回 409 并标注
+    是哪一侧，均有效时只比较两份锁的根可达包。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    before_lock: dict[str, str] = Field(
+        ...,
+        description=(
+            "比较基准的锁定清单：包名（PEP 503 规范化匹配）-> PEP 440 版本；"
+            "格式与 /audit-lock 的 current_lock 相同。"
+        ),
+    )
+    after_lock: dict[str, str] = Field(
+        ...,
+        description=(
+            "比较目标的锁定清单：包名（PEP 503 规范化匹配）-> PEP 440 版本；"
+            "格式与 before_lock 相同。"
+        ),
+    )
+
+
 # --------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------- #
@@ -697,5 +723,93 @@ class LicensePolicyResponse(BaseModel):
         description=(
             "许可证表达式判定为未知的包，按规范化包名排序；"
             "既未拒绝也未全部/任一允许，或锁定版本未提供 metadata.license。"
+        ),
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /lock-diff 响应
+# --------------------------------------------------------------------- #
+class LockDiffEntryOut(BaseModel):
+    """单个包在两份锁定清单间的变化项（含前后依赖图中的全部最短根路径）。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    name: str = Field(..., description="规范化包名（PEP 503）。")
+    from_: str | None = Field(
+        ..., alias="from", description="before_lock 中的版本；added 项为 null。"
+    )
+    to: str | None = Field(
+        ..., description="after_lock 中的版本；removed 项为 null。"
+    )
+    before_paths: list[list[str]] = Field(
+        ...,
+        description=(
+            "before_lock 依赖图中根包到该包的全部最短包路径（字典序排序）；"
+            "该包不在 before_lock 中时为 []。"
+        ),
+    )
+    after_paths: list[list[str]] = Field(
+        ...,
+        description=(
+            "after_lock 依赖图中根包到该包的全部最短包路径（字典序排序）；"
+            "该包不在 after_lock 中时为 []。"
+        ),
+    )
+
+
+class LockDiffResponse(BaseModel):
+    """两份锁定清单均有效时的差异比较结果。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    added: list[LockDiffEntryOut] = Field(
+        ..., description="只在 after_lock 中出现的包，按规范化包名排序。"
+    )
+    removed: list[LockDiffEntryOut] = Field(
+        ..., description="只在 before_lock 中出现的包，按规范化包名排序。"
+    )
+    upgraded: list[LockDiffEntryOut] = Field(
+        ...,
+        description="两份锁中都存在、after 版本按 PEP 440 严格更高的包，按包名排序。",
+    )
+    downgraded: list[LockDiffEntryOut] = Field(
+        ...,
+        description="两份锁中都存在、after 版本按 PEP 440 严格更低的包，按包名排序。",
+    )
+
+
+class LockDiffFailureOut(BaseModel):
+    """409 时一侧未通过审计的锁定清单及其问题。"""
+
+    model_config = {"extra": "forbid"}
+
+    side: Literal["before", "after"] = Field(
+        ..., description="未通过审计的是哪一侧：before_lock 或 after_lock。"
+    )
+    issues: list[AuditIssueOut] = Field(
+        ...,
+        description=(
+            "该侧锁定清单的审计问题，与 /audit-lock 完全一致，确定性排序："
+            "先按类型（missing、unavailable、constraint_mismatch、"
+            "extraneous），再按规范化包名。"
+        ),
+    )
+
+
+class LockDiffInvalidResponse(BaseModel):
+    """任一锁定清单未通过审计：409，不执行差异比较。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["invalid_lock"]
+    message: str
+    failures: list[LockDiffFailureOut] = Field(
+        ...,
+        description=(
+            "未通过审计的各侧及其问题，固定按 before -> after 次序排列；"
+            "仅列出无效的一侧（两侧均无效时列出两条）。"
         ),
     )

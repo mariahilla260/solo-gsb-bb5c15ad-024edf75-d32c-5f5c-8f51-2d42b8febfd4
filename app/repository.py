@@ -258,9 +258,13 @@ def version_satisfies(
     return version in spec
 
 
-def parse_current_lock(raw: dict[str, str]) -> dict[str, Version]:
-    """校验并规范化 POST /upgrade 的 current_lock：PEP 503 包名 -> PEP 440 版本。
+def parse_current_lock(
+    raw: dict[str, str], *, field: str = "current_lock"
+) -> dict[str, Version]:
+    """校验并规范化请求中的锁定清单：PEP 503 包名 -> PEP 440 版本。
 
+    用于 /upgrade、/audit-lock 的 current_lock 与 /lock-diff 的
+    before_lock / after_lock（``field`` 决定错误信息中的字段名）。
     非法版本、或同一规范化包名对应多个不同版本时抛 SnapshotError
     （API 层映射为 422）。
     """
@@ -272,11 +276,11 @@ def parse_current_lock(raw: dict[str, str]) -> dict[str, Version]:
             version = Version(version_text)
         except InvalidVersion as exc:
             raise SnapshotError(
-                f"current_lock 中包 {cname!r} 的版本 {text!r} 不是合法的 PEP 440 版本"
+                f"{field} 中包 {cname!r} 的版本 {text!r} 不是合法的 PEP 440 版本"
             ) from exc
         if cname in lock and lock[cname] != version:
             raise SnapshotError(
-                f"current_lock 中包 {cname!r} 出现了多个不同版本"
+                f"{field} 中包 {cname!r} 出现了多个不同版本"
             )
         lock[cname] = version
     return lock

@@ -24,6 +24,13 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 `allow` / `deny` 标识集合做**三态判定**（允许 / 拒绝 / 未知），返回按包名
 排序的 `violations` 与 `unknowns`，每项附根包到该包的**全部最短路径**；
 非法 SPDX 表达式或 allow/deny 规则重叠返回 422。
+`/lock-diff` 在**同一份仓库快照与目标环境**下比较 `before_lock` 与
+`after_lock` 两份锁定清单：两份锁各自按 `/audit-lock` 的同一套规则
+**独立校验**，任一无效返回 409 并明确标注是 `before` 还是 `after` 及其
+审计问题；均有效时**只比较根可达包**，按规范化包名输出 `added` /
+`removed` / `upgraded` / `downgraded`（版本方向按 PEP 440 判断），每个
+变化项同时给出它在前后两张依赖图中的**全部最短根路径**（不存在的一侧
+为空数组）。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -58,6 +65,7 @@ docker compose up --build
 | 依赖路径接口 | `POST http://localhost:8000/dependency-paths` |
 | SBOM 导出接口 | `POST http://localhost:8000/sbom` |
 | 许可证策略接口 | `POST http://localhost:8000/license-policy` |
+| 锁定差异接口 | `POST http://localhost:8000/lock-diff` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -954,6 +962,120 @@ curl -s -X POST http://localhost:8000/license-policy \
 | `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `WITH`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
 
+### `POST /lock-diff`
+
+在**同一份仓库快照与目标环境**下比较两份锁定清单（`before_lock` →
+`after_lock`）的差异。请求体包含 `/resolve` 的全部字段（`repository` /
+`root` / `target_environment` / `specifier` / `allow_prereleases`，语义
+完全一致），并附加两个锁定清单字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `before_lock` | `object` | 是 | 比较基准的锁定清单：`{包名: 版本}`，格式同 `/audit-lock` 的 `current_lock` |
+| `after_lock` | `object` | 是 | 比较目标的锁定清单，格式同 `before_lock` |
+
+处理流程：
+
+1. **两份锁各自独立地按 `/audit-lock` 的同一套规则校验**（同一快照、
+   同一目标环境、同一根约束；即使一侧已无效也继续审计另一侧）。
+   任一无效时返回 **409**，`failures` 按 `before` → `after` 的固定次序
+   列出**无效侧**及其审计问题（与 `/audit-lock` 的输出逐字节一致），
+   **不执行任何差异比较**（响应中没有 `added` 等字段）；
+2. 两份锁均有效时**不做任何版本选择**：各按锁定版本与目标环境激活的
+   依赖建图（与 `/dependency-paths` 同一张图的构造规则），**只比较
+   两张图中的根可达包**（有效锁的根可达包集恰为锁中全部包）；
+3. 逐包比较并归类：只在 `after_lock` 中出现的为 `added`，只在
+   `before_lock` 中出现的为 `removed`，两侧都有但版本按 **PEP 440**
+   严格更高的为 `upgraded`、严格更低的为 `downgraded`；等价版本
+   （如 `1.0` 与 `1.0.0`）**不产生变化项**。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"ok"` |
+| `root` | 规范化（PEP 503）后的根包名 |
+| `added` / `removed` / `upgraded` / `downgraded` | 四组变化项列表，各自**按规范化包名排序**；无该类变化时为 `[]` |
+| 变化项 `.name` | 规范化包名（PEP 503） |
+| 变化项 `.from` / `.to` | 该包在 `before_lock` / `after_lock` 中的版本；`added` 项 `from` 为 `null`，`removed` 项 `to` 为 `null` |
+| 变化项 `.before_paths` / `.after_paths` | 该包在前后两张依赖图中根包到它的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序）；该包不存在的一侧为 `[]` |
+
+```bash
+curl -s -X POST http://localhost:8000/lock-diff \
+  -H 'Content-Type: application/json' \
+  -d @examples/lock-diff.json
+```
+
+示例中 `web-framework 2.4.0 → 3.2.0`（升级）改变了它声明的依赖：
+`observability-lib 1.0.0` 被新拉入（added），`legacy-helper 0.8.0` 随之
+淘汰（removed），`cache-lib 2.0.0 → 1.5.0` 为降级；`app` / `auth-lib` /
+`shared-util` 未变，不出现在结果中：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "added": [
+    {
+      "name": "observability-lib",
+      "from": null,
+      "to": "1.0.0",
+      "before_paths": [],
+      "after_paths": [["app", "web-framework", "observability-lib"]]
+    }
+  ],
+  "removed": [
+    {
+      "name": "legacy-helper",
+      "from": "0.8.0",
+      "to": null,
+      "before_paths": [["app", "web-framework", "legacy-helper"]],
+      "after_paths": []
+    }
+  ],
+  "upgraded": [
+    {
+      "name": "web-framework",
+      "from": "2.4.0",
+      "to": "3.2.0",
+      "before_paths": [["app", "web-framework"]],
+      "after_paths": [["app", "web-framework"]]
+    }
+  ],
+  "downgraded": [
+    {
+      "name": "cache-lib",
+      "from": "2.0.0",
+      "to": "1.5.0",
+      "before_paths": [["app", "cache-lib"]],
+      "after_paths": [["app", "cache-lib"]]
+    }
+  ]
+}
+```
+
+确定性与比较细节：
+
+- 根包自身也是根可达包：两份锁锁定不同根版本时，根包同样作为
+  `upgraded` / `downgraded` 的一项出现（路径为单节点路径 `[根包]`）。
+- 版本方向严格按 PEP 440 比较（`1.9.0 → 1.10.0` 是升级而非降级；
+  `1.0` 与 `1.0.0` 等价，不产生变化项）。
+- 同一包在前后两张图中的引入路径可以不同（经由不同的中间包），
+  `before_paths` / `after_paths` 各自如实给出。
+- 未激活 marker 依赖不参与建图：换一个 `target_environment`，两张图
+  随之变化（某份锁在新环境下审计失败则返回 409）。
+- 输出只取决于快照、目标环境与两份锁定清单：四个列表按包名排序、
+  路径按字典序排序，与包键、依赖声明、锁键的输入顺序无关，重复请求
+  逐字节一致。
+
+`/lock-diff` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 两份锁均有效，差异比较完成（四个列表均为空也是 200，表示两份锁等价） |
+| `409` | 任一锁定清单未通过审计：`status: "invalid_lock"`，`failures` 按 `before` → `after` 次序列出无效侧及其与 `/audit-lock` 一致的审计问题，不执行差异比较 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `before_lock` / `after_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本（错误信息会注明是哪一份锁） |
+
 ---
 
 ## 三、解析规则说明
@@ -1010,6 +1132,15 @@ curl -s -X POST http://localhost:8000/license-policy \
     未知。`violations` 与 `unknowns` 各自按包名排序，每项复用
     第 11 条的最短路径算法附根包到该包的全部最短路径；非法 SPDX 表达式
     （含 `WITH`）、allow/deny 非法标识或两集合重叠返回 422，输出确定。
+15. **锁定差异（`/lock-diff`）**：`before_lock` 与 `after_lock` 在同一
+    快照、同一目标环境、同一根约束下各自复用第 10 条的审计；任一无效
+    返回 409，`failures` 按 before → after 次序标注无效侧及其审计问题，
+    不做比较。均有效时各按第 11 条建图，只比较两张图的根可达包：只在
+    after 中出现的为 added、只在 before 中的为 removed、两侧都有但
+    版本按 PEP 440 严格更高/更低的为 upgraded/downgraded（等价版本不
+    产生变化项）；每个变化项附它在前后两张图中的全部最短根路径（不
+    存在的一侧为空数组），四个列表均按规范化包名排序，输出与输入顺序
+    无关。
 
 ### 安全护栏
 
@@ -1028,10 +1159,11 @@ app/
   sbom.py           # 沿已激活依赖图导出确定性 JSON SBOM（PURL / 元数据 / 缺失 warnings）
   spdx.py           # SPDX 许可证表达式词法/递归下降解析与 allow/deny 三态求值
   license_policy.py # 有效锁图上的逐包许可证策略判定（违规/未知 + 全部最短路径）
+  lock_diff.py      # 两份有效锁定清单的根可达包差异（added/removed/upgraded/downgraded + PEP 440 方向 + 双侧最短路径）
   repository.py     # 快照规范化、PEP 440/503 解析、按环境过滤 marker、候选元数据校验
   markers.py        # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py        # 请求/响应模型
-examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy 示例）
+examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy、/lock-diff 示例）
 tests/               # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml
