@@ -24,6 +24,12 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 `allow` / `deny` 标识集合做**三态判定**（允许 / 拒绝 / 未知），返回按包名
 排序的 `violations` 与 `unknowns`，每项附根包到该包的**全部最短路径**；
 非法 SPDX 表达式或 allow/deny 规则重叠返回 422。
+`/lock-diff` 在**同一份仓库快照与同一目标环境**下提交 `before_lock` 与
+`after_lock` 两份锁定清单：两份锁**各自独立复用 `/audit-lock` 的同一套
+规则**校验，任一无效即整体 **409** 并分别标注 before/after 的审计问题；
+均有效时**只比较根可达包**，按规范化包名输出 `added` / `removed` /
+`upgraded` / `downgraded`（版本方向按 PEP 440 判断），每个变化项同时
+给出其在前后依赖图中的**全部最短根路径**（不存在的一侧为空数组）。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -58,6 +64,7 @@ docker compose up --build
 | 依赖路径接口 | `POST http://localhost:8000/dependency-paths` |
 | SBOM 导出接口 | `POST http://localhost:8000/sbom` |
 | 许可证策略接口 | `POST http://localhost:8000/license-policy` |
+| 锁差异比较接口 | `POST http://localhost:8000/lock-diff` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -954,6 +961,175 @@ curl -s -X POST http://localhost:8000/license-policy \
 | `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `WITH`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
 
+### `POST /lock-diff`
+
+用**同一份仓库快照与同一个目标环境**比较两份锁定清单
+（`before_lock` → `after_lock`）。请求体沿用 `/resolve` 的 `repository` /
+`root` / `target_environment` / `specifier` / `allow_prereleases`（语义
+完全一致），并附加两份锁：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `before_lock` | `object` | 是 | 比较**基准**锁定清单：`{包名: 版本}`，格式同 `/audit-lock` 的 `current_lock` |
+| `after_lock` | `object` | 是 | 比较**目标**锁定清单：格式同 `before_lock` |
+
+处理流程：
+
+1. **两份锁各自独立复用 `/audit-lock` 的同一套规则校验**（同一份快照、
+   同一目标环境、同一根约束与 marker 激活语义）。即使某一份已经无效，
+   另一份仍照常审计；
+2. **任一份锁无效即整体返回 409**，响应分别标注 `before` 与 `after` 的
+   审计结果（各为 `{"valid", "issues"}`，`issues` 与 `/audit-lock`
+   逐字节一致、确定性排序），**不执行任何差异比较**；
+3. 两份锁均有效时**不做任何版本选择**：分别按各自锁定版本展开已激活
+   依赖，构造两张与 `/dependency-paths` 同语义的根可达图（未激活 marker
+   依赖不是图的边），只比较两张图的**根可达包**集合与锁定版本：
+
+   | 分类 | 判定 |
+   | --- | --- |
+   | `added` | 仅在 after 根可达（`before_version` 为 `null`，`before_paths` 为 `[]`） |
+   | `removed` | 仅在 before 根可达（`after_version` 为 `null`，`after_paths` 为 `[]`） |
+   | `upgraded` | 两侧均可达，after 锁定版本**严格高于** before（PEP 440） |
+   | `downgraded` | 两侧均可达，after 锁定版本**严格低于** before（PEP 440） |
+
+   PEP 440 等价版本（`1.0` 与 `1.0.0`）不产生变化项；根包本身发生
+   升降级时同样进入 `upgraded` / `downgraded`（其最短路径为单节点
+   `[根包]`）。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"ok"` |
+| `root` | 规范化（PEP 503）后的根包名 |
+| `added` / `removed` / `upgraded` / `downgraded` | 四类变化列表，各自**按规范化包名排序**；无变化时为 `[]` |
+| 每类列表项 `name` | PEP 503 规范化包名 |
+| `before_version` / `after_version` | 前后锁中的 PEP 440 版本字符串；added/removed 时缺失一侧为 `null` |
+| `before_paths` / `after_paths` | 该包在**前 / 后依赖图**中从根包出发的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序）；该包在对应一侧**不存在时为空数组 `[]`** |
+
+```bash
+curl -s -X POST http://localhost:8000/lock-diff \
+  -H 'Content-Type: application/json' \
+  -d @examples/lock-diff.json
+```
+
+示例中 after 相对 before：`web-framework 2.4.0 → 3.2.0` 改拉
+`telemetry-lib` 而不再依赖 `legacy-helper`（一增一删），`auth-lib
+0.9.0 → 1.1.0` 新引入 `json-tool 1.0.0`（`<2.0`，降级通道的候选），
+`shared-util 1.5.0 → 2.0.0` 同时经 `web-framework` 与 `auth-lib` 两条
+等长菱形路径引入（两侧路径都返回）：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "added": [
+    {
+      "name": "json-tool",
+      "before_version": null,
+      "after_version": "1.0.0",
+      "before_paths": [],
+      "after_paths": [["app", "auth-lib", "json-tool"]]
+    },
+    {
+      "name": "telemetry-lib",
+      "before_version": null,
+      "after_version": "1.0.0",
+      "before_paths": [],
+      "after_paths": [["app", "web-framework", "telemetry-lib"]]
+    }
+  ],
+  "removed": [
+    {
+      "name": "legacy-helper",
+      "before_version": "0.5.0",
+      "after_version": null,
+      "before_paths": [["app", "web-framework", "legacy-helper"]],
+      "after_paths": []
+    }
+  ],
+  "upgraded": [
+    {
+      "name": "auth-lib",
+      "before_version": "0.9.0",
+      "after_version": "1.1.0",
+      "before_paths": [["app", "auth-lib"]],
+      "after_paths": [["app", "auth-lib"]]
+    },
+    {
+      "name": "shared-util",
+      "before_version": "1.5.0",
+      "after_version": "2.0.0",
+      "before_paths": [
+        ["app", "auth-lib", "shared-util"],
+        ["app", "web-framework", "shared-util"]
+      ],
+      "after_paths": [
+        ["app", "auth-lib", "shared-util"],
+        ["app", "web-framework", "shared-util"]
+      ]
+    },
+    {
+      "name": "web-framework",
+      "before_version": "2.4.0",
+      "after_version": "3.2.0",
+      "before_paths": [["app", "web-framework"]],
+      "after_paths": [["app", "web-framework"]]
+    }
+  ],
+  "downgraded": []
+}
+```
+
+任一份锁无效时返回 **409**，`before` / `after` 分别给出该侧的独立审计
+结果（即使只有一侧无效，另一侧也带 `"valid": true, "issues": []`）：
+
+```json
+{
+  "status": "invalid_lock",
+  "message": "锁定清单未通过审计，未执行差异比较：before_lock、after_lock 无效",
+  "before": {
+    "valid": false,
+    "issues": [
+      {
+        "type": "missing",
+        "name": "req",
+        "locked_version": null,
+        "available": ["1.0"],
+        "constraints": [
+          {"from": "app==1.0", "specifier": "*"}
+        ]
+      }
+    ]
+  },
+  "after": {
+    "valid": false,
+    "issues": [
+      {
+        "type": "extraneous",
+        "name": "ghost",
+        "locked_version": "9.9",
+        "available": [],
+        "constraints": []
+      }
+    ]
+  }
+}
+```
+
+确定性细节：比较只覆盖两张图的**根可达包**（锁中的不可达包会先在审计
+阶段以 `extraneous` 报出）；四个列表按规范化包名排序、路径按字典序
+排序，交换两份锁的提交位置时 `added` 与 `removed`、`upgraded` 与
+`downgraded` 对称互换，结果与包键 / 候选列表 / 锁键的输入顺序无关。
+
+`/lock-diff` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 两份锁均通过审计，差异比较完成（四类变化全为空表示根可达集与版本完全一致） |
+| `409` | `before_lock` / `after_lock` 任一未通过审计：`status: "invalid_lock"`，`before` / `after` 分别携带与 `/audit-lock` 一致的确定性排序问题，不执行比较 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `before_lock` / `after_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本 |
+
 ---
 
 ## 三、解析规则说明
@@ -1010,6 +1186,15 @@ curl -s -X POST http://localhost:8000/license-policy \
     未知。`violations` 与 `unknowns` 各自按包名排序，每项复用
     第 11 条的最短路径算法附根包到该包的全部最短路径；非法 SPDX 表达式
     （含 `WITH`）、allow/deny 非法标识或两集合重叠返回 422，输出确定。
+15. **锁差异比较（`/lock-diff`）**：同一份快照与目标环境下提交
+    before_lock / after_lock，两份锁**各自独立**复用第 10 条的审计
+    （即使一份已无效仍审计另一份），任一无效即整体 409 且分别标注
+    before/after 的问题、不做比较；均有效时在两张第 11 条的已激活依赖
+    图上只比较**根可达包**：after 独有为 added、before 独有为 removed、
+    两侧均有则按 PEP 440 版本方向分为 upgraded / downgraded（等价版本
+    不产生变化项）；每个变化项分别复用第 11 条的最短路径算法给出其在
+    前后图中的全部最短根路径，不存在的一侧为空数组；四类列表各按包名
+    排序、路径按字典序排序，交换提交位置结果对称，与输入顺序无关。
 
 ### 安全护栏
 
@@ -1028,10 +1213,11 @@ app/
   sbom.py           # 沿已激活依赖图导出确定性 JSON SBOM（PURL / 元数据 / 缺失 warnings）
   spdx.py           # SPDX 许可证表达式词法/递归下降解析与 allow/deny 三态求值
   license_policy.py # 有效锁图上的逐包许可证策略判定（违规/未知 + 全部最短路径）
+  lock_diff.py      # 两份有效锁的根可达包差异（added/removed/upgraded/downgraded + 双侧最短路径）
   repository.py     # 快照规范化、PEP 440/503 解析、按环境过滤 marker、候选元数据校验
   markers.py        # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py        # 请求/响应模型
-examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy 示例）
+examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy、/lock-diff 示例）
 tests/               # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml

@@ -27,6 +27,12 @@
   表达式，按请求的 allow/deny 标识集合做三态判定，返回按包名排序的
   violations 与 unknowns（各附根包到该包的全部最短路径）；
   非法 SPDX 表达式或 allow/deny 规则重叠返回 422
+* POST /lock-diff
+  同一份仓库快照与目标环境下提交 before_lock、after_lock 两份锁定清单：
+  各自独立复用 /audit-lock 规则校验，任一无效即整体 409 并分别标注
+  before/after 的审计问题；均有效时只比较两份锁的根可达包，按规范化
+  包名输出 added/removed/upgraded/downgraded（版本方向按 PEP 440），
+  每个变化项附其在前后依赖图中的全部最短根路径（不存在的一侧为空数组）
 * GET  /healthz     健康检查
 """
 
@@ -38,6 +44,7 @@ from packaging.version import Version
 
 from .audit import audit_lock
 from .license_policy import evaluate_license_policy
+from .lock_diff import diff_locks
 from .paths import build_locked_graph, shortest_paths
 from .repository import (
     SnapshotError,
@@ -57,6 +64,9 @@ from .schemas import (
     InvalidSnapshotResponse,
     LicensePolicyRequest,
     LicensePolicyResponse,
+    LockDiffInvalidResponse,
+    LockDiffRequest,
+    LockDiffResponse,
     ResolveMatrixRequest,
     ResolveMatrixResponse,
     MatrixUnresolvedResponse,
@@ -77,7 +87,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -672,4 +682,100 @@ def license_policy_endpoint(request: LicensePolicyRequest):
             content={"status": "invalid_snapshot", "message": str(exc)},
         )
 
+    return {"status": "ok", "root": root_canonical, **document}
+
+
+@app.post(
+    "/lock-diff",
+    summary="同一快照与目标环境下比较两份有效锁的根可达包差异",
+    response_model=LockDiffResponse,
+    responses={
+        409: {
+            "model": LockDiffInvalidResponse,
+            "description": "before_lock/after_lock 任一未通过审计：两侧问题分别标注",
+        },
+        422: {"model": InvalidSnapshotResponse, "description": "快照或任一锁非法"},
+    },
+)
+def lock_diff_endpoint(request: LockDiffRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    try:
+        repo = build_repository(payload["repository"], payload["target_environment"])
+        root_spec = parse_root_specifier(request.specifier)
+        before_lock = parse_current_lock(
+            payload["before_lock"], label="before_lock"
+        )
+        after_lock = parse_current_lock(payload["after_lock"], label="after_lock")
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    # 两份锁各自独立复用 /audit-lock 的同一套规则校验：即使某一份已无效，
+    # 另一份仍照常审计，以便 409 一次性标注 before/after 的全部问题。
+    before_result = audit_lock(
+        repo,
+        root_name=root_canonical,
+        root_spec=root_spec,
+        root_raw=request.specifier,
+        current_lock=before_lock,
+        allow_prereleases=request.allow_prereleases,
+    )
+    after_result = audit_lock(
+        repo,
+        root_name=root_canonical,
+        root_spec=root_spec,
+        root_raw=request.specifier,
+        current_lock=after_lock,
+        allow_prereleases=request.allow_prereleases,
+    )
+    if not before_result["valid"] or not after_result["valid"]:
+        invalid_sides = [
+            side
+            for side, result in (
+                ("before_lock", before_result),
+                ("after_lock", after_result),
+            )
+            if not result["valid"]
+        ]
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "invalid_lock",
+                "message": (
+                    "锁定清单未通过审计，未执行差异比较："
+                    + "、".join(invalid_sides)
+                    + " 无效"
+                ),
+                "before": {
+                    "valid": before_result["valid"],
+                    "issues": before_result["issues"],
+                },
+                "after": {
+                    "valid": after_result["valid"],
+                    "issues": after_result["issues"],
+                },
+            },
+        )
+
+    # 两份锁均有效：只比较根可达包，版本方向按 PEP 440；每个变化项附
+    # 前后依赖图中的全部最短根路径（不存在的一侧为空数组）。
+    document = diff_locks(
+        repo,
+        root_name=root_canonical,
+        before_lock=before_lock,
+        after_lock=after_lock,
+    )
     return {"status": "ok", "root": root_canonical, **document}

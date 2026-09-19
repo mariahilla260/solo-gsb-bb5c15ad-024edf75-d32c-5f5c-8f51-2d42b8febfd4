@@ -273,6 +273,39 @@ class LicensePolicyRequest(AuditLockRequest):
     )
 
 
+class LockDiffRequest(_ResolveInputs):
+    """POST /lock-diff 的请求体：同一快照与目标环境下比较两份锁。
+
+    在 /resolve 的快照/根/约束字段（不含单环境之外的字段）上附加单个
+    target_environment 与 before_lock / after_lock 两份锁定清单；两份锁
+    各自先独立复用 /audit-lock 的同一套规则校验，再做根可达包比较。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    target_environment: TargetEnvironmentIn = Field(
+        ...,
+        description=(
+            "必填的目标环境：两份锁在**同一个目标环境**下审计与建图"
+            "（marker 激活、约束核对语义与 /resolve 完全一致）。"
+        ),
+    )
+    before_lock: dict[str, str] = Field(
+        ...,
+        description=(
+            "比较基准锁定清单：包名（PEP 503 规范化匹配）-> PEP 440 版本；"
+            "先独立复用 /audit-lock 规则校验，无效时整体返回 409。"
+        ),
+    )
+    after_lock: dict[str, str] = Field(
+        ...,
+        description=(
+            "比较目标锁定清单：格式同 before_lock；与 before_lock 各自独立"
+            "审计，任一无效即整体返回 409 并标注 before/after 对应问题。"
+        ),
+    )
+
+
 # --------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------- #
@@ -698,4 +731,112 @@ class LicensePolicyResponse(BaseModel):
             "许可证表达式判定为未知的包，按规范化包名排序；"
             "既未拒绝也未全部/任一允许，或锁定版本未提供 metadata.license。"
         ),
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /lock-diff 响应
+# --------------------------------------------------------------------- #
+class LockChangeOut(BaseModel):
+    """两份锁之间的一个根可达包变化。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., description="PEP 503 规范化包名。")
+    before_version: str | None = Field(
+        ...,
+        description=(
+            "before_lock 中该包的锁定版本（PEP 440 字符串）；"
+            "added 时为 null。"
+        ),
+    )
+    after_version: str | None = Field(
+        ...,
+        description=(
+            "after_lock 中该包的锁定版本（PEP 440 字符串）；"
+            "removed 时为 null。"
+        ),
+    )
+    before_paths: list[list[str]] = Field(
+        ...,
+        description=(
+            "before 依赖图中根包到该包的所有最短包路径（每条为规范化包名"
+            "序列，含首尾，字典序确定性排序）；该侧不存在该包（added）时"
+            "恒为空数组 []。"
+        ),
+    )
+    after_paths: list[list[str]] = Field(
+        ...,
+        description=(
+            "after 依赖图中根包到该包的所有最短包路径（语义同 "
+            "before_paths）；该侧不存在该包（removed）时恒为空数组 []。"
+        ),
+    )
+
+
+class LockDiffResponse(BaseModel):
+    """两份锁均通过审计时的根可达包差异比较结果。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    added: list[LockChangeOut] = Field(
+        ...,
+        description=(
+            "仅在 after 根可达的包（before_version/before_paths 分别为 "
+            "null/[]），按规范化包名排序。"
+        ),
+    )
+    removed: list[LockChangeOut] = Field(
+        ...,
+        description=(
+            "仅在 before 根可达的包（after_version/after_paths 分别为 "
+            "null/[]），按规范化包名排序。"
+        ),
+    )
+    upgraded: list[LockChangeOut] = Field(
+        ...,
+        description=(
+            "两侧均可达、after 版本严格高于 before 的包（PEP 440 比较），"
+            "按规范化包名排序。"
+        ),
+    )
+    downgraded: list[LockChangeOut] = Field(
+        ...,
+        description=(
+            "两侧均可达、after 版本严格低于 before 的包（PEP 440 比较），"
+            "按规范化包名排序。"
+        ),
+    )
+
+
+class LockDiffInvalidLockOut(BaseModel):
+    """一份锁的独立审计结果：valid=false 时 issues 与 /audit-lock 同形。"""
+
+    model_config = {"extra": "forbid"}
+
+    valid: bool = Field(..., description="该锁是否通过审计（issues 为空）。")
+    issues: list[AuditIssueOut] = Field(
+        ...,
+        description=(
+            "该锁的审计问题，与 /audit-lock 完全一致且确定性排序：先按类型"
+            "（missing、unavailable、constraint_mismatch、extraneous），"
+            "再按规范化包名。"
+        ),
+    )
+
+
+class LockDiffInvalidResponse(BaseModel):
+    """before_lock/after_lock 任一未通过审计：409，两侧结果分别标注。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["invalid_lock"]
+    message: str
+    before: LockDiffInvalidLockOut = Field(
+        ..., description="before_lock 的独立审计结果（valid/issues）。"
+    )
+    after: LockDiffInvalidLockOut = Field(
+        ..., description="after_lock 的独立审计结果（valid/issues）。"
     )
